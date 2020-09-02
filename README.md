@@ -45,7 +45,7 @@ List of the services used:
 
 - Here is the entire workflow of what's happening behind the scene:
 
-![Flow end-to-end](Architecture-Diagrams/COVID-19_Architecture)
+![Flow end-to-end](Architecture-Diagrams/COVID-19_Architecture.png)
 
 ## Security
 
