@@ -1,0 +1,735 @@
+# Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# https://aws.amazon.com/agreement
+# SPDX-License-Identifier: MIT-0
+
+# IMPORTANT
+# This solution only works in the following regions:
+#   - US East
+#     - us-east-1	(N. Virginia)
+#     - us-west-2 (Oregon)
+#   - GovCloud
+#       - us-gov-west-1 (US-West)
+#   - Europe
+#       - eu-central-1 (Frankfurt)
+#       - eu-west-1 (Ireland)
+#   - Asia Pacific
+#       - ap-northeast-1 (Tokyo)
+#       - ap-south-1 (Mumbai)
+#       - ap-southeast-1 (Singapore)
+#       - ap-southeast-2 (Sydney)
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: This template creates a notifications' system to send you a SMS on your phone number with the latest COVID-19 updates in your country.(RCS-COVID-D15643056)
+
+###
+### CloudFormation Interface Metadata
+###
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+          default: "SNS configuration"
+      Parameters:
+        - pWebsiteURL
+        - pCountry
+        - pRegisterCellPhoneSNSLambdaName
+        - pCovidLambdaName
+        - pUpdatedWebsiteLambdaName
+    ParameterLabels:
+        pWebsiteURL:
+          default: Website’s URL 
+        pCountry:
+          default: Name of the country
+        pRegisterCellPhoneSNSLambdaName:
+          default: Lambda function name Register citizen’s phone number
+        pCovidLambdaName:
+          default: Lambda function name to check for website updates 
+        pUpdatedWebsiteLambdaName:
+          default: Lambda function name to publish to SNS topic
+
+Parameters:
+  pWebsiteURL:
+    Description: 'Website URL to check for Covid-19 updates'
+    Type: String
+    Default: "https://www.example.gov/info-coronavirus"
+
+  pCountry:
+    Description: 'Depending on the country where the solution will be deployed, it will change the language of the text message the citizen will receive'
+    Type: String
+    Default: "US"
+    AllowedValues:
+      - US
+      - FR
+  pRegisterCellPhoneSNSLambdaName:
+    Description: 'Name of Lambda function used to register citizen phone number as subscriber into the SNS topic'
+    Type: String
+    Default: "RegisterCellPhoneSNS"
+
+  pCovidLambdaName:
+    Description: 'Name of Lambda function used to checks if there is a difference between old page (object stored in S3) and current page every 5 minutes (CW Events is behind) - if so, publish to SNS topic that there is an update'
+    Type: String
+    Default: "CovidUpdateSNS"
+
+  pUpdatedWebsiteLambdaName:
+    Description: 'Name of Lambda function triggered by an API (Government employee) to publish to SNS topic that there is an update'
+    Type: String
+    Default: "UpdatedWebsiteLambda"
+
+Mappings:
+  mLanguage:
+    US:
+      MessageText: "We have updated our COVID-19 website, please follow the link for more details"
+    FR:
+      MessageText: "Nous avons mis Ã  jour notre site web concernant le COVID-19, merci de cliquer sur ce lien pour plus de dÃ©tails "
+
+Resources:
+  rCovidBucket:
+    Type: "AWS::S3::Bucket"
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "covidupdatebucket-${AWS::Region}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  
+  rSiteUpdateSNSTopic:
+    Type: AWS::SNS::Topic
+    DeletionPolicy: Delete
+    Properties: 
+      DisplayName: COVID Site updates SNS Topic
+      TopicName: COVID_Site_updates_SNS_Topic
+
+          
+  rRegisterCellPhoneSNSPolicy:
+    Type: 'AWS::IAM::Policy'
+    DependsOn:  rRegisterCellPhoneSNSRole
+    DeletionPolicy: Delete
+    Properties:
+      Roles:
+        - !Ref rRegisterCellPhoneSNSRole
+      PolicyName: rRegisterCellPhoneSNSPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sns:ListSubscriptionsByTopic'
+              - 'sns:Subscribe'
+            Resource: !Ref rSiteUpdateSNSTopic
+          - Effect: Allow
+            Action:
+              - 'sns:ListTopics'
+              - 'sns:ListSubscriptions'
+            Resource: '*'
+
+  rRegisterCellPhoneSNSExecutionPolicy:
+    Type: 'AWS::IAM::Policy'
+    DeletionPolicy: Delete
+    DependsOn: 
+      - rRegisterCellPhoneSNSRole
+      - rSiteUpdateSNSTopic
+    Properties:
+      Roles:
+        - !Ref rRegisterCellPhoneSNSRole
+      PolicyName: rRegisterCellPhoneSNSExecutionPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'mobiletargeting:GetEndpoint'
+              - 'mobiletargeting:UpdateEndpoint'
+              - 'mobiletargeting:PutEvents'
+            Resource: !Sub arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/projectId/endpoints/*
+          - Effect: Allow
+            Action:
+              - 'mobiletargeting:PhoneNumberValidate'
+            Resource: !Sub arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:phone/number/validate
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              
+  rRegisterCellPhoneSNSRole:
+    Type: "AWS::IAM::Role"
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: !Sub "rRegisterCellPhoneSNSRole-${AWS::AccountId}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - lambda.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+
+  rRegisterCellPhoneSNSLambda:
+    Type: "AWS::Lambda::Function"
+    DependsOn: rRegisterCellPhoneSNSRole
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: !Ref pRegisterCellPhoneSNSLambdaName
+      Runtime: python3.7
+      Environment:
+        Variables:
+            sns_topic: !Ref rSiteUpdateSNSTopic
+      Code:
+        ZipFile: |
+            import json
+            import boto3
+            import os
+
+            sns_client = boto3.client('sns')
+            pinpoint_client = boto3.client('pinpoint')
+
+            def lambda_handler(event, context):
+                print(event['body'])
+                fields = event['body'].split(";");
+                for field in fields:
+                    values = field.split("=")
+                    if values[0] == "phoneNumber":
+                        phoneNumber = values[1]
+                    elif values[0] == "countryCode":
+                        countryCode = values[1]
+            
+                try:
+                    response = pinpoint_client.phone_number_validate(
+                        NumberValidateRequest={
+                            'IsoCountryCode': countryCode,
+                            'PhoneNumber': phoneNumber
+                        }
+                    )
+                    print(response)
+                    snsTopic = os.getenv('sns_topic')
+                    print(response['NumberValidateResponse']['CleansedPhoneNumberE164'])
+                    response = sns_client.subscribe(
+                        TopicArn=snsTopic,
+                        Protocol='sms',
+                        Endpoint=response['NumberValidateResponse']['CleansedPhoneNumberE164']
+                    )
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps('Success')
+                    }
+                except:
+                    return {
+                        'statusCode': 400,
+                        'body': json.dumps('Failure')
+                    }
+
+      Handler: "index.lambda_handler"
+      Role: !GetAtt rRegisterCellPhoneSNSRole.Arn
+
+  rLambdaApiGatewayInvoke:
+    Type: "AWS::Lambda::Permission"
+    DependsOn: rRegisterCellPhoneSNSRestApi
+    DeletionPolicy: Delete
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt rRegisterCellPhoneSNSLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${rRegisterCellPhoneSNSRestApi}/*/POST/register"
+
+  rRegisterCellPhoneSNSRestApi:
+    Type: AWS::ApiGateway::RestApi
+    DeletionPolicy: Delete
+    Properties:
+      Name: CovidNotifyMe
+      Description: "API to register for COVID-19 website updates"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      
+  rApiGatewayRootMethod:
+    Type: "AWS::ApiGateway::Method"
+    DependsOn: rApiGatewayResource
+    DeletionPolicy: Delete
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "POST"
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "rRegisterCellPhoneSNSLambda.Arn"
+      ResourceId: !Ref rApiGatewayResource
+      RestApiId: !Ref "rRegisterCellPhoneSNSRestApi"
+      
+  rApiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    DeletionPolicy: Delete
+    Properties:
+      RestApiId: !Ref rRegisterCellPhoneSNSRestApi
+      ParentId: !GetAtt rRegisterCellPhoneSNSRestApi.RootResourceId
+      PathPart: register
+
+  rApiGatewayDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DeletionPolicy: Delete
+    DependsOn:
+      - "rApiGatewayRootMethod"
+    Properties:
+      RestApiId: !Ref "rRegisterCellPhoneSNSRestApi"
+      StageName: prod
+                
+  rCovidLambdaRole:
+    Type: "AWS::IAM::Role"
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: !Sub "rCovidLambdaRole-${AWS::AccountId}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        -
+          PolicyName: "ReadAndWriteToBucket"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "s3:*"
+                Resource: [
+                  !Sub "arn:aws:s3:::covidupdatebucket-${AWS::Region}-${AWS::AccountId}",
+                  !Sub "arn:aws:s3:::covidupdatebucket-${AWS::Region}-${AWS::AccountId}/*"
+                ]
+              -
+                Effect: "Allow"
+                Action: "logs:CreateLogGroup"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action: [
+                  "logs:CreateLogStream",
+                  "logs:PutLogEvents"
+                ]
+                Resource: [
+                  !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CovidUpdateSNS:*"
+                ]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+  rCovidLambda:
+    Type: "AWS::Lambda::Function"
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: !Ref pCovidLambdaName
+      Runtime: "python3.7"
+      Environment:
+        Variables:
+            WebsiteURL: !Ref pWebsiteURL
+            MessageText: !FindInMap [mLanguage, !Ref pCountry, MessageText]
+            BucketName: !Ref pUpdatedWebsiteLambdaName
+            SNSTopic: !Ref rSiteUpdateSNSTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import urllib3
+          import os
+          import botocore
+
+          # Define URL
+          url = os.getenv("WebsiteURL")
+          statusUrl = os.getenv("WebsiteURL")
+          messageText = os.getenv("MessageText")
+
+          # Set up http request maker thing
+          http = urllib3.PoolManager()
+
+          # S3 object to store the last call
+          bucket_name = os.getenv("BucketName")
+          file_name = 'current_webpage.txt'
+
+          s3 = boto3.resource('s3')
+
+          # Check if the bucket is empty or not (if not we create an empty file)
+          try:
+              s3.Object(bucket_name, 'current_webpage.txt').load()
+          except botocore.exceptions.ClientError as e:
+              if e.response['Error']['Code'] == "404":
+                  print("doesn't exist")
+                  s3.Bucket(bucket_name).put_object(Key=file_name)
+              else:
+                  raise
+          else:
+              print("does exist")
+
+          object_s3 = boto3.resource('s3') \
+                          .Bucket(bucket_name) \
+                          .Object(file_name)
+
+          # Connect to AWS Simple Notification Service
+          sns_client = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              # Ping website
+              resp = http.request('GET',statusUrl)
+              new_page = resp.data
+              # read in old results
+              old_page = object_s3.get().get('Body').read()
+              
+              if new_page == old_page:
+                  print("No new updates.")
+              else:
+                  print("-- New Update --")
+                  sns_client = boto3.client('sns')
+                  sns_topic = os.getenv('SNSTopic')
+                  try:
+                      response = sns_client.publish(
+                          TopicArn = sns_topic,
+                          Message = f'{messageText}: {url}',
+                      )
+                      print(f"Successfully sent to SNS topic")
+                  except:
+                      print(f"Failed to send to SNS topic")
+                      
+                  # Write new data to S3
+                  object_s3.put(Body = new_page)
+                  print("Successfully wrote new data to S3")
+              print("done")
+              return None
+
+      Handler: "index.lambda_handler"
+      Role: !GetAtt rCovidLambdaRole.Arn
+
+  rUpdatedWebsiteLambdaRole:
+    Type: "AWS::IAM::Role"
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: !Sub "rUpdatedWebsiteLambdaRole-${AWS::AccountId}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        -
+          PolicyName: "LogsAndSns"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "logs:CreateLogGroup"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action: [
+                  "logs:CreateLogStream",
+                  "logs:PutLogEvents"
+                ]
+                Resource: [
+                  !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/rUpdatedWebsiteLambda:*"
+                ]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+  rUpdatedWebsiteLambda:
+    Type: "AWS::Lambda::Function"
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: !Ref pUpdatedWebsiteLambdaName
+      Runtime: "python3.7"
+      Environment:
+        Variables:
+            WebsiteURL: !Ref pWebsiteURL
+            MessageText: !FindInMap [mLanguage, !Ref pCountry, MessageText]
+            SNSTopic: !Ref rSiteUpdateSNSTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import urllib3
+          import os
+          import botocore
+
+          # Define URL
+          website = os.getenv("WebsiteURL")
+          messageText = os.getenv("MessageText")
+
+          # Set up http request maker thing
+          http = urllib3.PoolManager()
+
+          # Connect to AWS Simple Notification Service
+          sns_client = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              # Ping website
+              resp = http.request('GET',website)
+              
+              sns_topic = os.getenv('SNSTopic')
+              sns_client = boto3.client('sns')
+              try:
+                response = sns_client.publish(
+                    TopicArn = sns_topic,
+                    Message = f'{messageText}: {website}',
+                )
+                print(f"Successfully sent to SNS topic")
+              except:
+                print(f"Failed to send to SNS topic")
+              print("done")
+              return None
+
+      Handler: "index.lambda_handler"
+      Role: !GetAtt rUpdatedWebsiteLambdaRole.Arn
+
+  rTrigger:
+    Type: "AWS::Events::Rule"
+    DeletionPolicy: Delete
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(5 minutes)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "rCovidLambda"
+              - "Arn"
+          Id: "TargetFunctionV1"
+
+  rPermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    DeletionPolicy: Delete
+    Properties: 
+      FunctionName: 
+        Ref: "rCovidLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "rTrigger"
+          - "Arn"
+
+  rRegisterCellPhoneSNSLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref pRegisterCellPhoneSNSLambdaName]]
+
+  rRegisterCellPhoneSNSMetricFilterMaxMemoryUsed:
+    Type: "AWS::Logs::MetricFilter"
+    DeletionPolicy: Delete
+    DependsOn: rRegisterCellPhoneSNSLogGroup
+    Properties:
+        LogGroupName: !Join ["", ["/aws/lambda/", !Ref pRegisterCellPhoneSNSLambdaName]]
+        FilterPattern: "[..., maxMemoryLabel=\"Used:\", maxMemory, maxMemoryUnit=MB]"
+        MetricTransformations:
+            -
+                MetricValue: "$maxMemory"
+                MetricNamespace: !Ref pRegisterCellPhoneSNSLambdaName
+                MetricName: "MaxMemoryUsedMB"
+
+  rRegisterCellPhoneSNSMetricFilterMemorySize:
+    Type: "AWS::Logs::MetricFilter"
+    DeletionPolicy: Delete
+    DependsOn: rRegisterCellPhoneSNSLogGroup
+    Properties:
+        LogGroupName: !Join ["", ["/aws/lambda/", !Ref pRegisterCellPhoneSNSLambdaName]]
+        FilterPattern: "[..., sizeLabel=\"Size:\", sizeMemory, sizeMemoryUnit=MB, maxLabel, memoryLabel, maxMemoryLabel=\"Used:\", maxMemory, maxMemoryUnit=MB]"
+        MetricTransformations:
+            -
+                MetricValue: "$sizeMemory"
+                MetricNamespace: !Ref pRegisterCellPhoneSNSLambdaName
+                MetricName: "MemorySizeMB"
+
+  rRegisterCellPhoneSNSDurationAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    DeletionPolicy: Delete
+    DependsOn: rRegisterCellPhoneSNSLambda
+    Properties:
+        AlarmName: "CodeRegisterCellPhoneSNSDurationAlarm"
+        AlarmDescription: "rTrigger an alarm if the duration is over 500ms"
+        MetricName: "Duration"
+        Namespace: "AWS/Lambda"
+        Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pRegisterCellPhoneSNSLambdaName
+        Statistic: "Average"
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 500
+        ComparisonOperator: "GreaterThanThreshold"
+
+  rRegisterCellPhoneSNSErrorsAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    DeletionPolicy: Delete
+    DependsOn: rRegisterCellPhoneSNSLambda
+    Properties:
+        AlarmName: "CodeRegisterCellPhoneSNSErrorsAlarm"
+        AlarmDescription: "rTrigger an alarm if an error is recorded"
+        MetricName: "Errors"
+        Namespace: "AWS/Lambda"
+        Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pRegisterCellPhoneSNSLambdaName
+        Statistic: "Sum"
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: "GreaterThanThreshold"
+
+  rRegisterCellPhoneSNSInvocationsAlarm:
+      Type: "AWS::CloudWatch::Alarm"
+      DeletionPolicy: Delete
+      DependsOn: rRegisterCellPhoneSNSLambda
+      Properties:
+          AlarmName: "CodeRegisterCellPhoneSNSInvocationsAlarm"
+          AlarmDescription: "rTrigger an alarm if the function is not invoked at least one per day"
+          MetricName: "Invocations"
+          Namespace: "AWS/Lambda"
+          Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pRegisterCellPhoneSNSLambdaName
+          Statistic: "Sum"
+          Period: 86400
+          EvaluationPeriods: 1
+          Threshold: 1
+          ComparisonOperator: "LessThanThreshold"
+
+  rRegisterCellPhoneSNSThrottlesAlarm:
+      Type: "AWS::CloudWatch::Alarm"
+      DeletionPolicy: Delete
+      DependsOn: rRegisterCellPhoneSNSLambda
+      Properties:
+          AlarmName: "CodeRegisterCellPhoneSNSThrottlesAlarm"
+          AlarmDescription: "rTrigger an alarm if a throttle is recorded"
+          MetricName: "Throttles"
+          Namespace: "AWS/Lambda"
+          Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pRegisterCellPhoneSNSLambdaName
+          Statistic: "Sum"
+          Period: 60
+          EvaluationPeriods: 1
+          Threshold: 0
+          ComparisonOperator: "GreaterThanThreshold"
+
+  rCovidLambdaLogGroup:
+      Type: "AWS::Logs::LogGroup"
+      DeletionPolicy: Delete
+      Properties:
+          LogGroupName: !Join ["", ["/aws/lambda/", !Ref pCovidLambdaName]]
+
+  rCovidLambdaMetricFilterMaxMemoryUsed:
+      Type: "AWS::Logs::MetricFilter"
+      DeletionPolicy: Delete
+      DependsOn: rCovidLambdaLogGroup
+      Properties:
+          LogGroupName: !Join ["", ["/aws/lambda/", !Ref pCovidLambdaName]]
+          FilterPattern: "[..., maxMemoryLabel=\"Used:\", maxMemory, maxMemoryUnit=MB]"
+          MetricTransformations:
+              -
+                  MetricValue: "$maxMemory"
+                  MetricNamespace: !Ref pCovidLambdaName
+                  MetricName: "MaxMemoryUsedMB"
+  rCovidLambdaMetricFilterMemorySize:
+      Type: "AWS::Logs::MetricFilter"
+      DeletionPolicy: Delete
+      DependsOn: rCovidLambdaLogGroup
+      Properties:
+          LogGroupName: !Join ["", ["/aws/lambda/", !Ref pCovidLambdaName]]
+          FilterPattern: "[..., sizeLabel=\"Size:\", sizeMemory, sizeMemoryUnit=MB, maxLabel, memoryLabel, maxMemoryLabel=\"Used:\", maxMemory, maxMemoryUnit=MB]"
+          MetricTransformations:
+              -
+                  MetricValue: "$sizeMemory"
+                  MetricNamespace: !Ref pCovidLambdaName
+                  MetricName: "MemorySizeMB"
+  rCovidLambdaDurationAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    DeletionPolicy: Delete
+    DependsOn: rCovidLambda
+    Properties:
+        AlarmName: "CodeCovidLambdaDurationAlarm"
+        AlarmDescription: "rTrigger an alarm if the duration is over 500ms"
+        MetricName: "Duration"
+        Namespace: "AWS/Lambda"
+        Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pCovidLambdaName
+        Statistic: "Average"
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 500
+        ComparisonOperator: "GreaterThanThreshold"
+
+  rCovidLambdaErrorsAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    DeletionPolicy: Delete
+    DependsOn: rCovidLambda
+    Properties:
+        AlarmName: "CodeCovidLambdaErrorsAlarm"
+        AlarmDescription: "rTrigger an alarm if an error is recorded"
+        MetricName: "Errors"
+        Namespace: "AWS/Lambda"
+        Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pCovidLambdaName
+        Statistic: "Sum"
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: "GreaterThanThreshold"
+
+  rCovidLambdaInvocationsAlarm:
+      Type: "AWS::CloudWatch::Alarm"
+      DeletionPolicy: Delete
+      DependsOn: rCovidLambda
+      Properties:
+          AlarmName: "CodeCovidLambdaInvocationsAlarm"
+          AlarmDescription: "rTrigger an alarm if the function is not invoked at least one per day"
+          MetricName: "Invocations"
+          Namespace: "AWS/Lambda"
+          Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pCovidLambdaName
+          Statistic: "Sum"
+          Period: 86400
+          EvaluationPeriods: 1
+          Threshold: 1
+          ComparisonOperator: "LessThanThreshold"
+
+  rCovidLambdaThrottlesAlarm:
+      Type: "AWS::CloudWatch::Alarm"
+      DeletionPolicy: Delete
+      DependsOn: rCovidLambda
+      Properties:
+          AlarmName: "CodeCovidLambdaThrottlesAlarm"
+          AlarmDescription: "rTrigger an alarm if a throttle is recorded"
+          MetricName: "Throttles"
+          Namespace: "AWS/Lambda"
+          Dimensions:
+            -
+                Name: "FunctionName"
+                Value: !Ref pCovidLambdaName
+          Statistic: "Sum"
+          Period: 60
+          EvaluationPeriods: 1
+          Threshold: 0
+          ComparisonOperator: "GreaterThanThreshold"
